@@ -22,12 +22,12 @@ NUM_EPOCHS = 4
 GAMMA = 0.99             
 GAE_LAMBDA = 0.95        
 CLIP_COEF = 0.2          
-ENT_COEF = 0.02          # Increased Entropy to encourage exploration of new strats
+ENT_COEF = 0.02          
 VF_COEF = 0.5            
 MAX_GRAD_NORM = 0.5      
 
 # --- FLAGS ---
-LOAD_MODEL = True
+LOAD_MODEL = False
 MODEL_PATH = "latest_model.pt"
 POOL_DIR = "model_pool"
 
@@ -67,6 +67,11 @@ def train():
 
     for update in range(1, num_updates + 1):
         agent.eval() 
+        
+        # --- NEW: Metric containers for this epoch ---
+        epoch_winner_scores = []
+        epoch_avg_scores = []
+
         for step in range(NUM_STEPS):
             global_step += NUM_ENVS
             obs[step] = next_obs
@@ -83,6 +88,11 @@ def train():
 
             next_obs, reward, next_done, info = env.step(action)
             rewards[step] = reward
+            
+            # --- NEW: Capture Stats from Info ---
+            if "avg_winner" in info:
+                epoch_winner_scores.append(info["avg_winner"])
+                epoch_avg_scores.append(info["avg_score"])
 
         # GAE
         with torch.no_grad():
@@ -155,6 +165,14 @@ def train():
         writer.add_scalar("charts/value_loss", v_loss.item(), global_step)
         writer.add_scalar("charts/policy_loss", pg_loss.item(), global_step)
         writer.add_scalar("charts/fps", fps, global_step)
+        
+        # --- NEW: Log Game Scores ---
+        if len(epoch_winner_scores) > 0:
+            avg_win = np.mean(epoch_winner_scores)
+            avg_tot = np.mean(epoch_avg_scores)
+            writer.add_scalar("game/avg_winner_score", avg_win, global_step)
+            writer.add_scalar("game/avg_total_score", avg_tot, global_step)
+            print(f"   -> Game Stats: Avg Winner ~{avg_win:.1f} pts | Avg ~{avg_tot:.1f} pts")
         
         if update % 20 == 0:
             torch.save(agent.state_dict(), MODEL_PATH)

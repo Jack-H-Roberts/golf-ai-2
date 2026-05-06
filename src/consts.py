@@ -36,12 +36,24 @@ FACE_STR_MAP = {
 }
 
 # --- OBSERVATION SIZES ---
-OBS_SIZE = 736
+# 728-dim obs (simplified env, new encoding):
+#   1   stage flag (PLAY_DRAW=1 vs PLAY_DISCARD=0)
+#   5   relative finisher one-hot
+#   26  graveyard distribution: 13 P(face|red) + 13 P(face|blue), normalized over unseen pool
+#   15  top discard:  1 color + 13 face one-hot + 1 normalized point value (always visible)
+#   1   top draw color (face is unknown; distribution comes from graveyard[color])
+#   675 hand cards (45 cards x 15 dims):
+#         1 color + 13 face (one-hot if visible, all-zero if face-down) + 1 value (or 0)
+#   5   per-player face-down count, ego-rotated, normalized /9
+OBS_SIZE = 728
 ACTION_SIZE = 10
+
+# 4 cards of each (color, face) in 2 standard decks (no jokers).
+INITIAL_PER_COLOR_FACE = 4
 
 # --- STAGE CONSTANTS ---
 STAGE_ARRANGE = 0
 STAGE_FLIP_1 = 1
 STAGE_FLIP_2 = 2
-STAGE_PLAY_DRAW = 3    
+STAGE_PLAY_DRAW = 3
 STAGE_PLAY_DISCARD = 4

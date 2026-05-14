@@ -60,7 +60,7 @@ LR_END = 3e-5
 SCORE_MIN = -12.0
 SCORE_MAX = 90.0
 SCORE_RANGE = SCORE_MAX - SCORE_MIN
-SCORE_LOSS_WEIGHT = 10.0
+SCORE_LOSS_WEIGHT = 0
 
 # --- LEAGUE CONFIG ---
 LEAGUE_NUM_ROLES = 5
@@ -517,10 +517,16 @@ def train():
         acting_at_save = env.current_player_idx.clone()
         role_for_env = seat_assignment.gather(1, acting_at_save.unsqueeze(1)).squeeze(1)
 
-        # --- Save obs into pending only for envs where the latest (role 0/1) is acting. ---
-        latest_mask = torch.zeros_like(role_for_env, dtype=torch.bool)
-        for r in LEAGUE_LATEST_ROLES:
-            latest_mask = latest_mask | (role_for_env == r)
+        # --- Save obs into pending. While league_pool is empty, all roles point
+        # to the latest network, so the role-based filter would just waste data;
+        # save everything. Once league_pool has snapshots, restrict saves to the
+        # roles that use the latest (training) network.
+        if len(list_league_checkpoints()) > 0:
+            latest_mask = torch.zeros_like(role_for_env, dtype=torch.bool)
+            for r in LEAGUE_LATEST_ROLES:
+                latest_mask = latest_mask | (role_for_env == r)
+        else:
+            latest_mask = torch.ones_like(role_for_env, dtype=torch.bool)
         latest_ids = latest_mask.nonzero().squeeze(1)
         if latest_ids.numel() > 0:
             pending.append(latest_ids, next_obs[latest_ids], acting_at_save[latest_ids])

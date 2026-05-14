@@ -35,27 +35,24 @@ FACE_STR_MAP = {
     FACE_QUEEN: "Q", FACE_KING: "K"
 }
 
-# Cards 0-51 are red deck, 52-103 are blue deck. card // 52 = color, card % 13 = face.
+# Cards 0-51 are red, 52-103 are blue. card // 52 = color, card % 13 = face.
 RED = 0
 BLUE = 1
 
 # --- STAGE CONSTANTS ---
-# 5 stages, encoded as one-hot in obs (whose stage = the acting player's stage).
-STAGE_ARRANGE = 0       # Choose how to lay out R reds and 9-R blues across the 3x3.
-STAGE_FLIP1 = 1         # Choose first slot to flip.
-STAGE_FLIP2 = 2         # Choose second slot to flip (must differ from FLIP1's slot).
-STAGE_PLAY_DRAW = 3     # First play choice: see top discard, decide take/pass.
-STAGE_PLAY_DISCARD = 4  # Second play choice: passed already, see drawn card, decide take/pass.
+STAGE_ARRANGE = 0
+STAGE_FLIP1 = 1
+STAGE_FLIP2 = 2
+STAGE_PLAY_DRAW = 3
+STAGE_PLAY_DISCARD = 4
 NUM_STAGES = 5
 
-# --- COLUMN INDICES (3x3 grid arranged 0..8 row-major) ---
-# Columns are vertical: indices [0,3,6], [1,4,7], [2,5,8]
+# --- COLUMN INDICES (3x3 grid, 0..8 row-major) ---
+# Column 0 = slots 0, 3, 6 (vertical left); Column 1 = 1, 4, 7; Column 2 = 2, 5, 8.
+# Bijection: slot = pos*3 + col, where pos = slot // 3 (row), col = slot % 3.
 COLUMNS = [(0, 3, 6), (1, 4, 7), (2, 5, 8)]
 
 # --- ARRANGEMENT PARTITION TABLE ---
-# Maps (R, action_index) → partition (k0, k1, k2) reds across columns.
-# Partitions are sorted-decreasing canonical form; columns are interchangeable
-# so picking any specific (k0, k1, k2) covers all column-permuted equivalents.
 PARTITIONS_PER_R = {
     0: [(0, 0, 0)],
     1: [(1, 0, 0)],
@@ -69,14 +66,10 @@ PARTITIONS_PER_R = {
     9: [(3, 3, 3)],
 }
 MAX_ARRANGEMENT_OPTIONS = 3
-NUM_OPTIONS_PER_R = [len(PARTITIONS_PER_R[r]) for r in range(10)]  # [1,1,2,3,3,3,3,2,1,1]
+NUM_OPTIONS_PER_R = [len(PARTITIONS_PER_R[r]) for r in range(10)]
 
 
 def _build_red_slot_mask_table():
-    """Returns a [10, 3, 9] long tensor: red_slot_mask[R, k, slot] = 1 if that
-    slot holds a red card under PARTITIONS_PER_R[R][k]. For k >= NUM_OPTIONS_PER_R[R]
-    we clamp to the last valid partition so out-of-range actions are well-defined.
-    """
     import torch
     table = torch.zeros((10, MAX_ARRANGEMENT_OPTIONS, 9), dtype=torch.long)
     for r in range(10):
@@ -93,26 +86,56 @@ def _build_red_slot_mask_table():
     return table
 
 
-# --- OBSERVATION SIZES (891 dims, deal-order global, no ego rotation) ---
-#   5    whose-turn one-hot (deal order)
-#   5    finisher one-hot (deal order; all-zero if no finisher yet)
-#   5    has-taken-final-turn bitmap (deal order)
-#   5    acting player's stage one-hot (5 stages)
-#   1    remaining reds across players-after-acting still in ARRANGE (sum/9)
-#   26   graveyard distribution: 13 P(face|red) + 13 P(face|blue) over unseen pool
-#   17   top discard:  2 color one-hot + 13 face one-hot + 1 norm point value + 1 visibility (=1)
-#   17   top draw:     2 color one-hot + 13 face dist (from grav[color]) + 1 value (=0) + 1 visibility (=0)
-#   765  hand cards (5 players * 9 cards * 17 dims, deal order)
-#         per card (placed):    2 color + 13 face (one-hot if visible, P(face|color) if face-down) + 1 value + 1 visibility
-#         per card (unplaced):  all 17 dims = 0
-#   15   per-column expected score (5 players * 3 columns); 0 for unplaced players
-#   15   per-column 3-of-a-kind probability (5 players * 3 columns); 0 for unplaced players
-#   5    per-player total hand expected score (deal order); 0 for unplaced players
-#   5    per-player face-down count (deal order, normalized /9); 0 for unplaced players
-#   5    per-player score gap from leader (own_EV - min_EV); 0 for unplaced players
-OBS_SIZE = 891
-ACTION_SIZE = 10           # 9 slot replacements / partition options + 1 pass
-VALUE_OUTPUT_DIM = NUM_PLAYERS  # 5-dim P(player wins) softmax
+# --- CANONICALIZATION ALPHABET ---
+# 15-letter ordering, ascending: K=0, Q=1, J=2, 10=3, 9=4, 8=5, 7=6, 6=7, 5=8,
+# 4=9, 3=10, 2=11, A=12, B-down=13, R-down=14.
+# Visible: alphabet = 12 - face (so K(face=12)→0, A(face=0)→12).
+# Face-down: 13 if blue, 14 if red.
+# Smallest at canonical slot 0 (top-left); largest at slot 8 (bottom-right).
+ALPHABET_BDOWN = 13
+ALPHABET_RDOWN = 14
+ALPHABET_SIZE = 15
+COL_KEY_BASE = ALPHABET_SIZE         # 15
+COL_KEY_BASE_SQ = COL_KEY_BASE ** 2  # 225
 
-# 4 cards of each (color, face) in 2 standard decks (no jokers).
+# --- OBSERVATION LAYOUT (OBS_SIZE = 886) ---
+# Post-ego-rotation: per-player blocks ordered with acting=0, then dealer-cycle.
+# whose-turn one-hot dropped (always [1,0,0,0,0] after rotation).
+# Per-card encoding (17 dims): color bits zeroed for visible cards (visible-color
+# collapse — color is redundant given the graveyard block).
+#
+#   5    finisher one-hot                  [0:5]      ← rotated
+#   5    has-taken-final-turn              [5:10]     ← rotated
+#   5    acting player's stage             [10:15]
+#   1    remaining reds                    [15:16]
+#   26   graveyard distribution            [16:42]    (13 red, 13 blue) ← color block
+#   17   top discard                       [42:59]    (2 color + 13 face + 1 val + 1 vis)
+#   17   top draw                          [59:76]
+#   765  hand cards (5 * 9 * 17)           [76:841]   ← rotated; visible-color collapsed
+#   15   per-column expected score         [841:856]  ← rotated
+#   15   per-column 3-of-a-kind prob       [856:871]  ← rotated
+#   5    per-player hand EV                [871:876]  ← rotated
+#   5    per-player face-down count        [876:881]  ← rotated
+#   5    per-player score gap              [881:886]  ← rotated
+OBS_OFFSET_FINISHER = 0
+OBS_OFFSET_FINAL_TURNS_TAKEN = 5
+OBS_OFFSET_STAGE = 10
+OBS_OFFSET_REMAINING_REDS = 15
+OBS_OFFSET_GRAVEYARD = 16
+OBS_OFFSET_TOP_DISCARD = 42
+OBS_OFFSET_TOP_DRAW = 59
+OBS_OFFSET_HAND_CARDS = 76
+OBS_OFFSET_COL_EV = 841
+OBS_OFFSET_COL_MATCH = 856
+OBS_OFFSET_HAND_EV = 871
+OBS_OFFSET_FD_COUNT = 876
+OBS_OFFSET_SCORE_GAP = 881
+
+OBS_HAND_CARD_DIM = 17
+OBS_NUM_HAND_CARDS = NUM_PLAYERS * 9
+
+OBS_SIZE = 886
+ACTION_SIZE = 10
+VALUE_OUTPUT_DIM = NUM_PLAYERS
+
 INITIAL_PER_COLOR_FACE = 4

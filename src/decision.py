@@ -1,18 +1,19 @@
 """Decision-making for the value-network architecture, all 5 stages.
 
-  ARRANGE: enumerate up to 3 partition options for player's R; eval each via NN.
-  FLIP1:   enumerate 9 slots × 13 face outcomes; pick slot maximizing E_F[NN].
-  FLIP2:   same with already-flipped slot masked out.
-  PLAY_DRAW: full chance-node expectimax (Branch A: take, B: pass-then-take, C: pass-pass).
-  PLAY_DISCARD: 2-option lookahead (take to slot, or pass).
+Stage 3 changes
+===============
+1. `_own_winp` now reads `probs[:, rotated_acting_idx]` where the rotation pivot
+   used to build the obs determines where the acting player sits:
+     - ARRANGE, FLIP1 → obs pivot = acting → acting at rotated position 0.
+     - FLIP2, PLAY_DRAW branches A/B/C, PLAY_DISCARD → obs pivot = (acting+1)%5
+       → acting at rotated position 4.
+   This was wrong in Stage 2: the old code gathered `probs[:, acting_per_row]`
+   (deal-order index) but the obs has been ego-rotated since Stage 2, so the
+   network output is in rotated order.
 
-Recent changes:
-  - Branch B is now a single forward pass over all (F=13, C=2) chance outcomes.
-    3,042 leaves per env in one matmul; watch VRAM at high K.
-  - `_own_winp` uses float16 autocast on CUDA (Turing/Ampere+ Tensor Cores).
-  - `_grav_dist` returns (unseen_counts, dist) so callers don't recompute.
-  - Network now returns (win_logits, score_pred); decision uses win head only.
-  - `make_decisions(..., return_diagnostics=True)` returns per-env top-1/top-2 win-prob.
+2. `make_decisions` accepts optional `env_ids` for league play subsetting.
+   When provided, only those envs are processed; the returned actions tensor
+   has size [num_envs] with non-subset entries at default value 9 (pass).
 """
 
 import torch
@@ -24,26 +25,53 @@ from .consts import (
 )
 
 
-@torch.no_grad()
-def make_decisions(env, network, epsilon=0.0, return_diagnostics=False):
-    """Returns actions, optionally a diagnostics dict.
+# Rotated-position indices for the acting player in the network output.
+# Derived from how each stage builds its what-if obs (see _own_winp docstring).
+_ROT_ACTING_AT_0 = 0                       # ARRANGE, FLIP1
+_ROT_ACTING_AT_PREV = NUM_PLAYERS - 1      # FLIP2, play branches (pivot = next, so acting = -1 % 5 = 4)
 
-    diagnostics dict (per-env tensors):
-      stage : stage of each env (0..4).
+
+@torch.no_grad()
+def make_decisions(env, network, epsilon=0.0, return_diagnostics=False, env_ids=None):
+    """Returns actions [num_envs], optionally a diagnostics dict.
+
+    If env_ids is provided, only those envs are processed. The returned tensor
+    has shape [num_envs]; non-subset entries are left at default value 9 (pass).
+    Caller should select only env_ids when merging.
+
+    diagnostics dict (per-env tensors, size [num_envs]; entries outside env_ids
+    are NaN / -1):
+      stage : stage of each env (0..4 or -1 if not in subset).
       top1  : best action's predicted own-win-prob.
       top2  : runner-up action's predicted own-win-prob.
-      gap   : top1 - top2 (≥ 0; 0 if single valid option or exact tie).
-
-    top1/top2 reflect the network's evaluation regardless of ε-greedy choice.
+      gap   : top1 - top2.
     """
     device = env.device
     actions = torch.full((env.num_envs,), 9, dtype=torch.long, device=device)
-    acting = env.current_player_idx
-    stages = env.stages.gather(1, acting.unsqueeze(1)).squeeze(1)
+
+    if env_ids is None:
+        env_ids = torch.arange(env.num_envs, device=device)
 
     if return_diagnostics:
         top1_all = torch.full((env.num_envs,), float('nan'), device=device)
         top2_all = torch.full((env.num_envs,), float('nan'), device=device)
+        stage_all = torch.full((env.num_envs,), -1, dtype=torch.long, device=device)
+
+    if env_ids.numel() == 0:
+        if return_diagnostics:
+            return actions, {
+                "stage": stage_all,
+                "top1": top1_all,
+                "top2": top2_all,
+                "gap": top1_all - top2_all,
+            }
+        return actions
+
+    acting_sub = env.current_player_idx[env_ids]
+    stages_sub = env.stages[env_ids].gather(1, acting_sub.unsqueeze(1)).squeeze(1)
+
+    if return_diagnostics:
+        stage_all[env_ids] = stages_sub
 
     handlers = [
         (STAGE_ARRANGE,      _decide_arrange),
@@ -53,20 +81,21 @@ def make_decisions(env, network, epsilon=0.0, return_diagnostics=False):
         (STAGE_PLAY_DISCARD, _decide_play_discard),
     ]
     for stage_val, fn in handlers:
-        mask = (stages == stage_val)
+        mask = (stages_sub == stage_val)
         if mask.any():
-            ids = mask.nonzero().squeeze(1)
+            local_idx = mask.nonzero().squeeze(1)
+            global_ids = env_ids[local_idx]
             if return_diagnostics:
-                acts_here, t1, t2 = fn(env, network, ids, epsilon, return_diagnostics=True)
-                actions[ids] = acts_here
-                top1_all[ids] = t1
-                top2_all[ids] = t2
+                acts_here, t1, t2 = fn(env, network, global_ids, epsilon, return_diagnostics=True)
+                actions[global_ids] = acts_here
+                top1_all[global_ids] = t1
+                top2_all[global_ids] = t2
             else:
-                actions[ids] = fn(env, network, ids, epsilon)
+                actions[global_ids] = fn(env, network, global_ids, epsilon)
 
     if return_diagnostics:
         return actions, {
-            "stage": stages,
+            "stage": stage_all,
             "top1": top1_all,
             "top2": top2_all,
             "gap": top1_all - top2_all,
@@ -76,11 +105,7 @@ def make_decisions(env, network, epsilon=0.0, return_diagnostics=False):
 
 # ---------- shared helpers ----------
 def _grav_dist(env, env_ids):
-    """Returns (unseen_counts, dist) for the unseen-pool by color × face.
-
-    unseen_counts: [K, 2, 13] integer counts of unseen cards.
-    dist: [K, 2, 13] face dist conditioned on color (rows sum to 1).
-    """
+    """Returns (unseen_counts, dist) for the unseen-pool by color × face."""
     K = env_ids.numel()
     device = env.device
     seen = env.graveyard_counts[env_ids].clone()
@@ -95,19 +120,27 @@ def _grav_dist(env, env_ids):
     return unseen, dist
 
 
-def _own_winp(network, obs, acting_per_row):
-    """Forward the win head and return P(acting player wins) per row.
+def _own_winp(network, obs, rotated_acting_idx):
+    """Forward the win head and return P(acting wins) per row.
 
-    Uses float16 autocast on CUDA (Turing/Ampere+ Tensor Cores). Logits cast
-    to FP32 for softmax accuracy. Score head's output is discarded here
-    (used only during training).
+    The obs is ego-rotated around new_current_player_idx (the player who will
+    act NEXT in the what-if state). The network's per-player output is in that
+    rotation. `rotated_acting_idx` is where the (current) acting player sits
+    in that rotation:
+        - For obs built with new_current = acting (ARRANGE, FLIP1):
+          acting at position 0.
+        - For obs built with new_current = (acting+1) % 5 (FLIP2, play branches):
+          acting at position (acting - new_current) % 5 = -1 % 5 = 4.
+
+    Uses float16 autocast on CUDA. Logits cast to FP32 for softmax accuracy.
+    Score head's output is discarded here (used only during training).
     """
     device_type = obs.device.type
     use_amp = (device_type == 'cuda')
     with torch.autocast(device_type=device_type, dtype=torch.float16, enabled=use_amp):
         logits, _score = network(obs)
     probs = torch.softmax(logits.float(), dim=-1)
-    return probs.gather(1, acting_per_row.unsqueeze(1)).squeeze(1)
+    return probs[:, rotated_acting_idx]
 
 
 def _sample_from_mask(mask):
@@ -164,7 +197,8 @@ def _decide_arrange(env, network, env_ids, epsilon, return_diagnostics=False):
         new_hands=full_hands.reshape(BATCH, NUM_PLAYERS, 9),
         new_stages=new_stages.reshape(BATCH, NUM_PLAYERS),
     )
-    own = _own_winp(network, obs, acting.view(K, 1).expand(K, M).reshape(BATCH)).view(K, M)
+    # ARRANGE: new_current defaults to acting → acting at rotated position 0.
+    own = _own_winp(network, obs, _ROT_ACTING_AT_0).view(K, M)
 
     nopts = torch.tensor(NUM_OPTIONS_PER_R, device=device)[R]
     valid = torch.arange(M, device=device).view(1, M) < nopts.view(K, 1)
@@ -236,7 +270,10 @@ def _decide_flip(env, network, env_ids, epsilon, is_flip2, return_diagnostics=Fa
         new_stages=stages_b.reshape(BATCH, NUM_PLAYERS),
         new_current_player_idx=cur_b.reshape(BATCH),
     )
-    own = _own_winp(network, obs, acting.view(K, 1, 1).expand(K, 9, 13).reshape(BATCH)).view(K, 9, 13)
+    # FLIP1: new_current = acting → acting at 0.
+    # FLIP2: new_current = (acting+1)%5 → acting at 4.
+    rot_idx = _ROT_ACTING_AT_PREV if is_flip2 else _ROT_ACTING_AT_0
+    own = _own_winp(network, obs, rot_idx).view(K, 9, 13)
     ev_per_S = (own * p_F).sum(dim=-1)
 
     visible_mask = env.visible[env_ids, acting]
@@ -264,7 +301,6 @@ def _decide_play_draw(env, network, env_ids, epsilon, return_diagnostics=False):
     acting = env.current_player_idx[env_ids]
     rK = torch.arange(K, device=device)
 
-    # Single pass through unseen pool — was computed twice before.
     unseen, grav = _grav_dist(env, env_ids)
     color_marg_count = unseen.sum(dim=-1)
     p_color_marg = color_marg_count / color_marg_count.sum(dim=-1, keepdim=True).clamp(min=1.0)
@@ -322,21 +358,15 @@ def _branch_a(env, network, env_ids, acting, slot_colors, p_DF):
     next_p = (acting + 1) % NUM_PLAYERS
     obs = _build_play_obs(env, env_ids, acting, next_p, placed, slot_colors,
                           bury_old_top=False, advance_draw_ptr=False, draw_color_override=None)
-    acting_per_row = acting.view(1, 1, K).expand(9, 13, K).reshape(-1)
-    own = _own_winp(network, obs, acting_per_row).view(9, 13, K)
+    # _build_play_obs pivots around next_p → acting at rotated position 4.
+    own = _own_winp(network, obs, _ROT_ACTING_AT_PREV).view(9, 13, K)
     p_DF_arr = p_DF.permute(1, 2, 0)
     return (own * p_DF_arr).sum(dim=1).t()
 
 
 def _branch_b(env, network, env_ids, acting, draw_color, p_F_given_draw, p_color_marg, slot_colors, p_DF):
-    """Pass-then-take EV per slot. Single forward pass over all (F=13, C=2)
-    chance outcomes vectorized across slots and DF.
-
-    Total leaves per env: 9 * 13 * 13 * 2 = 3,042. Obs tensor at K envs is
-    [9 * 13 * 13 * 2 * K, OBS_SIZE] (FP32). At K=512 that's ~5.5 GB obs alone
-    plus activations — bigger than the 2060 Super's 6 GB VRAM. Drop NUM_ENVS
-    or chunk this function if you OOM.
-    """
+    """Pass-then-take EV per slot. Single forward pass over (F=13, C=2) chance
+    outcomes vectorized across slots and DF. See Stage 2 for full memory notes."""
     K = env_ids.numel()
     device = env.device
     next_p = (acting + 1) % NUM_PLAYERS
@@ -344,8 +374,6 @@ def _branch_b(env, network, env_ids, acting, draw_color, p_F_given_draw, p_color
     C_TOTAL = 2
     FCK = F_TOTAL * C_TOTAL * K
 
-    # Drawn-card identity per (F, C, K): color = draw_color[k], face = f.
-    # Layout: outer F → C → K so flat index = f*(C*K) + c*K + k.
     F_arange = torch.arange(F_TOTAL, device=device)
     placed_FCK = (
         draw_color.view(1, 1, K) * 52 + F_arange.view(F_TOTAL, 1, 1)
@@ -356,8 +384,6 @@ def _branch_b(env, network, env_ids, acting, draw_color, p_F_given_draw, p_color
     next_p_FCK    = next_p.view(1, 1, K).expand(F_TOTAL, C_TOTAL, K).reshape(-1)
     slot_colors_FCK = slot_colors.view(1, 1, K, 9).expand(F_TOTAL, C_TOTAL, K, 9).reshape(FCK, 9)
 
-    # Override (next-after-draw color) per obs row: c_val varies along C dim.
-    # Obs layout downstream is [9, 13, F, C, K] flattened.
     C_arange = torch.arange(C_TOTAL, device=device)
     override = C_arange.view(1, 1, 1, C_TOTAL, 1).expand(9, 13, F_TOTAL, C_TOTAL, K).reshape(-1)
 
@@ -365,20 +391,18 @@ def _branch_b(env, network, env_ids, acting, draw_color, p_F_given_draw, p_color
         env, env_ids_FCK, acting_FCK, next_p_FCK, placed_FCK, slot_colors_FCK,
         bury_old_top=True, advance_draw_ptr=True, draw_color_override=override,
     )
-    acting_per_row = acting_FCK.view(1, 1, FCK).expand(9, 13, FCK).reshape(-1)
-    own = _own_winp(network, obs, acting_per_row).view(9, 13, F_TOTAL, C_TOTAL, K)
+    # _build_play_obs pivots around next_p → acting at rotated position 4.
+    own = _own_winp(network, obs, _ROT_ACTING_AT_PREV).view(9, 13, F_TOTAL, C_TOTAL, K)
 
-    # Sum over DF (chance over displaced face) per slot.
-    p_DF_arr = p_DF.permute(1, 2, 0).view(9, 13, 1, 1, K)  # [S, DF, 1, 1, K]
-    ev_FCK_per_S = (own * p_DF_arr).sum(dim=1)              # [S, F, C, K]
+    p_DF_arr = p_DF.permute(1, 2, 0).view(9, 13, 1, 1, K)
+    ev_FCK_per_S = (own * p_DF_arr).sum(dim=1)
 
-    # Joint p(F, C) = p_F_given_draw[k, f] * p_color_marg[k, c]
-    p_F_FK = p_F_given_draw.t().unsqueeze(1)   # [F, 1, K]
-    p_C_CK = p_color_marg.t().unsqueeze(0)     # [1, C, K]
-    p_FC = (p_F_FK * p_C_CK).unsqueeze(0)       # [1, F, C, K]
+    p_F_FK = p_F_given_draw.t().unsqueeze(1)
+    p_C_CK = p_color_marg.t().unsqueeze(0)
+    p_FC = (p_F_FK * p_C_CK).unsqueeze(0)
 
-    ev_K = (ev_FCK_per_S * p_FC).sum(dim=(1, 2))  # [S, K]
-    return ev_K.t()                                # [K, 9]
+    ev_K = (ev_FCK_per_S * p_FC).sum(dim=(1, 2))
+    return ev_K.t()
 
 
 def _branch_c(env, network, env_ids, acting, draw_color, p_F_given_draw, p_color_marg):
@@ -410,8 +434,8 @@ def _branch_c(env, network, env_ids, acting, draw_color, p_F_given_draw, p_color
         new_draw_ptr=drawptr_b, new_stages=stages_b,
         new_current_player_idx=cur_b, draw_color_override=override,
     )
-    acting_per_row = acting.view(1, 1, K).expand(13, 2, K).reshape(-1)
-    own = _own_winp(network, obs, acting_per_row).view(13, 2, K)
+    # Pivot around next_p → acting at rotated position 4.
+    own = _own_winp(network, obs, _ROT_ACTING_AT_PREV).view(13, 2, K)
 
     p_FC = p_F_given_draw.t().unsqueeze(1) * p_color_marg.t().unsqueeze(0)
     return (own * p_FC).sum(dim=(0, 1))
@@ -420,8 +444,8 @@ def _branch_c(env, network, env_ids, acting, draw_color, p_F_given_draw, p_color
 def _build_play_obs(env, env_ids, acting, next_player, placed_card, slot_colors,
                     bury_old_top, advance_draw_ptr, draw_color_override):
     """Build [9*13*K, OBS_SIZE] for "place placed_card at slot S; old card → top discard".
-    Includes finishing logic. Callers may pass an "expanded" K (e.g., F_chunk × K_outer
-    in Branch B) to vectorize additional chance dimensions."""
+    Includes finishing logic. Sets new_current_player_idx = next_player, so the
+    output obs is ego-rotated around next_player."""
     K = env_ids.numel()
     device = env.device
     rS = torch.arange(9, device=device)
@@ -503,7 +527,6 @@ def _decide_play_discard(env, network, env_ids, epsilon, return_diagnostics=Fals
     acting = env.current_player_idx[env_ids]
     rK = torch.arange(K, device=device)
 
-    # The "drawn card" is currently the top discard (env moved it during PLAY_DRAW pass).
     drawn = env.top_discard[env_ids]
     slot_cards = env.hands[env_ids, acting]
     slot_colors = (slot_cards >= 52).long()
@@ -519,12 +542,13 @@ def _decide_play_discard(env, network, env_ids, epsilon, return_diagnostics=Fals
     obs_take = _build_play_obs(env, env_ids, acting, next_p, drawn, slot_colors,
                                 bury_old_top=False, advance_draw_ptr=False,
                                 draw_color_override=None)
-    acting_per_row = acting.view(1, 1, K).expand(9, 13, K).reshape(-1)
-    own_take = _own_winp(network, obs_take, acting_per_row).view(9, 13, K)
-    take_ev = (own_take * p_DF.permute(1, 2, 0)).sum(dim=1).t()  # [K, 9]
+    # _build_play_obs pivots around next_p → acting at 4.
+    own_take = _own_winp(network, obs_take, _ROT_ACTING_AT_PREV).view(9, 13, K)
+    take_ev = (own_take * p_DF.permute(1, 2, 0)).sum(dim=1).t()
 
     pass_obs = env.whatif_obs(env_ids=env_ids, new_current_player_idx=next_p)
-    own_pass = _own_winp(network, pass_obs, acting)  # [K]
+    # Same: pivot = next_p → acting at 4.
+    own_pass = _own_winp(network, pass_obs, _ROT_ACTING_AT_PREV)
 
     take_best, take_arg = take_ev.max(dim=-1)
     take_better = (take_best >= own_pass)
@@ -538,7 +562,7 @@ def _decide_play_discard(env, network, env_ids, epsilon, return_diagnostics=Fals
         result = greedy
 
     if return_diagnostics:
-        action_evs = torch.cat([take_ev, own_pass.unsqueeze(1)], dim=1)  # [K, 10]
+        action_evs = torch.cat([take_ev, own_pass.unsqueeze(1)], dim=1)
         top1, top2 = _topk2(action_evs)
         return result, top1, top2
     return result

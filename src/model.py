@@ -1,65 +1,43 @@
 import torch
 import torch.nn as nn
-from torch.distributions import Categorical
-import numpy as np
 
-class GolfNet(nn.Module):
-    def __init__(self, obs_size, action_size, hidden_dims=[1024, 512, 256]):
-        super(GolfNet, self).__init__()
-        
-        # --- SHARED FEATURE EXTRACTOR ---
-        # We use a shared trunk to process the game state
+
+class ValueNet(nn.Module):
+    """Value network for Golf with two heads on a shared trunk.
+
+    Inputs an OBS_SIZE-dim state vector. Returns:
+      - win_logits: [B, 5] logits over players (apply softmax for win-prob).
+      - score_pred: [B, 5] predicted *normalized* final scores per player.
+                    Multiply by SCORE_SCALE in train.py to recover raw scores.
+
+    The score head is auxiliary: the win-prob head owns decision-making, but the
+    score-regression loss flows back through the shared trunk and provides a
+    cleaner gradient than win-classification alone, accelerating convergence on
+    subtle state-quality differences.
+
+    Hidden architecture: [1024, 512, 256] with LayerNorm + ReLU.
+    """
+
+    def __init__(self, obs_size, num_players=5, hidden_dims=(1024, 512, 256)):
+        super().__init__()
         layers = []
-        input_dim = obs_size
-        
-        for h_dim in hidden_dims:
-            layers.append(nn.Linear(input_dim, h_dim))
-            layers.append(nn.LayerNorm(h_dim)) # Normalization helps stability
+        in_dim = obs_size
+        for h in hidden_dims:
+            layers.append(nn.Linear(in_dim, h))
+            layers.append(nn.LayerNorm(h))
             layers.append(nn.ReLU())
-            input_dim = h_dim
-            
-        self.feature_extractor = nn.Sequential(*layers)
-        
-        # --- ACTOR HEAD (Policy) ---
-        # Outputs logits for the 10 possible actions
-        self.actor_head = nn.Linear(hidden_dims[-1], action_size)
-        
-        # --- CRITIC HEAD (Value) ---
-        # Outputs a single scalar: "How many points do I expect to get?"
-        self.critic_head = nn.Linear(hidden_dims[-1], 1)
+            in_dim = h
+        self.trunk = nn.Sequential(*layers)
+        self.win_head = nn.Linear(in_dim, num_players)
+        self.score_head = nn.Linear(in_dim, num_players)
 
-    def forward(self, x, action_masks=None):
-        """
-        x: [Batch, 741] Observation Tensor
-        action_masks: [Batch, 10] Boolean Tensor (True = Invalid/Illegal move)
-        """
-        features = self.feature_extractor(x)
-        
-        # 1. Calculate Value (Critic)
-        value = self.critic_head(features)
-        
-        # 2. Calculate Action Logits (Actor)
-        logits = self.actor_head(features)
-        
-        # 3. Apply Action Masking
-        # We set the logits of invalid actions to negative infinity
-        # so the probability becomes 0 after Softmax.
-        if action_masks is not None:
-            # Create a very small number
-            HugeNeg = -1e9
-            logits = torch.where(action_masks, torch.tensor(HugeNeg, device=x.device), logits)
-            
-        return logits, value
+    def forward(self, x):
+        """Returns (win_logits, score_pred), both shape [B, 5]."""
+        h = self.trunk(x)
+        return self.win_head(h), self.score_head(h)
 
-    def get_action(self, x, action_masks=None, deterministic=False):
-        logits, value = self(x, action_masks)
-        probs = Categorical(logits=logits)
-        
-        if deterministic:
-            # For evaluation: Pick the absolute highest probability
-            action = torch.argmax(logits, dim=1)
-        else:
-            # For training: Sample from the distribution
-            action = probs.sample()
-            
-        return action, probs.log_prob(action), probs.entropy(), value
+    @torch.no_grad()
+    def predict_probs(self, x):
+        """Returns softmax win probabilities of shape [B, 5]. Score head ignored."""
+        logits, _ = self.forward(x)
+        return torch.softmax(logits, dim=-1)

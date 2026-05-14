@@ -1,175 +1,134 @@
-"""Evaluate a trained checkpoint vs uniform-random opponents.
+"""Evaluate the trained network by replacing one of the 5 self-play seats with
+a random-action opponent. If the network is making intelligent decisions, the
+4 network seats should win in aggregate at much greater than 80% (i.e., random
+should win significantly less than 20%).
 
-Agent plays as `agent_player` (default 0); the other 4 player slots play
-uniform-random over valid actions. Reports win/tie/loss rate over `target_games`.
+Run:
+    python eval_vs_random.py [path_to_model.pt] [num_games]
 
-Defaults to simplified=True (matching the new obs encoding and current training).
-
-Usage:
-    python eval_vs_random.py
-    python eval_vs_random.py --model model_pool/model_83886080.pt --games 10000
-    python eval_vs_random.py --player 2
-    python eval_vs_random.py --no-simplified           # for old-env checkpoints
+Defaults: latest_model.pt, 1000 games.
 """
 
-import os
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
-
-import argparse
-import math
+import sys
 import time
-
 import torch
-from torch.amp import autocast
 
-from src.model import GolfNet
+from src.consts import OBS_SIZE, NUM_PLAYERS, ACTION_SIZE, STAGE_PLAY_DRAW
+from src.model import ValueNet
 from src.vector_env import VectorGolfEnv
-from src.consts import OBS_SIZE, ACTION_SIZE, NUM_PLAYERS
+from src.decision import make_decisions
 
 
-def evaluate_vs_random(
-    model_path,
-    num_envs=2048,
-    target_games=5000,
-    agent_player=0,
-    use_mixed_precision=True,
-    simplified=True,
-    device=None,
-    verbose=True,
-):
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    use_amp = use_mixed_precision and (device.type == "cuda")
+NUM_ENVS = 256
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    if verbose:
-        print(f"Evaluating: {model_path}")
-        print(f"  Agent in slot {agent_player} vs uniform random in other {NUM_PLAYERS - 1} slots")
-        print(f"  Device: {device} | Mixed precision: {use_amp}")
-        print(f"  Env mode: {'simplified' if simplified else 'full'}")
-        print(f"  NUM_ENVS={num_envs} | target games: {target_games}")
-        print()
 
-    env = VectorGolfEnv(num_envs, device=device, simplified=simplified)
-    agent = GolfNet(OBS_SIZE, ACTION_SIZE).to(device)
-    agent.load_state_dict(torch.load(model_path, map_location=device))
-    agent.eval()
+@torch.no_grad()
+def make_decisions_mixed(env, network, random_seat):
+    """Network for all seats except `random_seat`, which uses uniform-random actions.
+    Note: we run the full lookahead for all envs (some compute is wasted on envs whose
+    acting player is the random seat) but it keeps the code simple and parallel.
+    """
+    actions_net = make_decisions(env, network, epsilon=0.0)
+    actions_rand = torch.randint(0, ACTION_SIZE, (env.num_envs,), device=env.device)
+    use_random = (env.current_player_idx == random_seat)
+    return torch.where(use_random, actions_rand, actions_net)
 
-    next_obs = env.get_obs()
 
-    games_completed = 0
-    agent_wins = 0
-    agent_ties = 0
-    agent_losses = 0
+def main():
+    model_path = sys.argv[1] if len(sys.argv) > 1 else "latest_model.pt"
+    num_games = int(sys.argv[2]) if len(sys.argv) > 2 else 1000
 
-    start_time = time.time()
-    last_print = start_time
+    print(f"Loading {model_path}")
+    network = ValueNet(OBS_SIZE, num_players=NUM_PLAYERS).to(DEVICE)
+    network.load_state_dict(torch.load(model_path, map_location=DEVICE))
+    network.eval()
 
-    while games_completed < target_games:
-        with torch.no_grad():
-            masks = env.get_action_masks()
-            acting_now = env.current_player_idx
+    env = VectorGolfEnv(NUM_ENVS, device=DEVICE)
 
-            with autocast(device_type="cuda", enabled=use_amp):
-                agent_action, _, _, _ = agent.get_action(next_obs, action_masks=masks)
+    # Track wins per seat (random vs network seats), aggregated across many games.
+    # We rotate which seat is random across games to avoid first-player bias.
+    random_wins = 0
+    network_wins = 0
+    total_games = 0
+    score_random_when_random = []   # random's own score when random was the random seat
+    score_network_when_random = []  # network seats' avg score when random was the random seat
+    decisions_per_game = []
 
-            random_logits = torch.zeros_like(masks, dtype=torch.float32)
-            random_logits.masked_fill_(masks, float("-inf"))
-            random_action = torch.distributions.Categorical(logits=random_logits).sample()
+    start = time.time()
+    # Each pass: pick a random seat to be "the random opponent" (rotates per env).
+    # Track over completed games.
+    random_seat_per_env = torch.randint(0, NUM_PLAYERS, (NUM_ENVS,), device=DEVICE)
 
-            is_agent_turn = (acting_now == agent_player)
-            action = torch.where(is_agent_turn, agent_action, random_action)
+    while total_games < num_games:
+        # We can't easily vary random_seat across envs in make_decisions_mixed because
+        # the network call is shared. Use a single random seat for the batch and re-roll
+        # when games complete. Simpler.
+        # Pick the most common seat for "this batch" — actually just use seat 0 throughout
+        # but vary by re-rolling on game-done. Simplest: keep a per-env random_seat tensor
+        # and gate by it.
+        # Since make_decisions_mixed compares acting==random_seat per env, and we have
+        # a per-env seat tensor, this generalizes naturally.
+        actions_net = make_decisions(env, network, epsilon=0.0)
+        actions_rand = torch.randint(0, ACTION_SIZE, (NUM_ENVS,), device=DEVICE)
+        use_random = (env.current_player_idx == random_seat_per_env)
+        actions = torch.where(use_random, actions_rand, actions_net)
 
-        next_obs, _, env_done, _, _, info = env.step(action)
+        next_obs, dones, _acting, info = env.step(actions)
 
         if "all_scores" in info:
-            all_scores = info["all_scores"]
-            K = all_scores.shape[0]
+            done_ids = info["done_env_ids"]
+            scores = info["all_scores"]            # [K, 5]
+            winners = info["winners_one_hot"]      # [K, 5] (rows sum to 1; ties split)
+            decs = info["decisions_per_player"]    # [K]
+            K = done_ids.numel()
 
-            agent_scores = all_scores[:, agent_player]
-            min_scores = all_scores.min(dim=1).values
+            random_seats_for_done = random_seat_per_env[done_ids]                          # [K]
+            seat_idx = random_seats_for_done.unsqueeze(1)                                  # [K, 1]
+            random_seat_winshare = winners.gather(1, seat_idx).squeeze(1)                  # [K]
+            network_winshare = 1.0 - random_seat_winshare                                  # [K]
+            random_wins += random_seat_winshare.sum().item()
+            network_wins += network_winshare.sum().item()
+            total_games += K
 
-            is_agent_min = (agent_scores == min_scores)
-            num_with_min = (all_scores == min_scores.unsqueeze(1)).sum(dim=1)
+            random_scores = scores.gather(1, seat_idx).squeeze(1)                          # [K]
+            other_mask = torch.ones_like(scores, dtype=torch.bool)
+            other_mask.scatter_(1, seat_idx, False)
+            network_scores_mean = scores[other_mask].view(K, NUM_PLAYERS - 1).mean(dim=1)  # [K]
 
-            agent_solo_win = is_agent_min & (num_with_min == 1)
-            agent_tie = is_agent_min & (num_with_min > 1)
-            agent_loss = ~is_agent_min
+            score_random_when_random.extend(random_scores.tolist())
+            score_network_when_random.extend(network_scores_mean.tolist())
+            decisions_per_game.extend(decs.tolist())
 
-            agent_wins += int(agent_solo_win.sum().item())
-            agent_ties += int(agent_tie.sum().item())
-            agent_losses += int(agent_loss.sum().item())
-            games_completed += K
+            # Reroll random seat for completed envs
+            random_seat_per_env[done_ids] = torch.randint(0, NUM_PLAYERS, (K,), device=DEVICE)
 
-            now = time.time()
-            if verbose and (now - last_print > 5.0):
-                elapsed = now - start_time
-                rate = games_completed / max(elapsed, 1e-6)
-                wr = agent_wins / max(games_completed, 1)
-                print(f"  Progress: {games_completed}/{target_games} games "
-                      f"({rate:.0f}/s) | win rate so far: {wr*100:.2f}%")
-                last_print = now
+    elapsed = time.time() - start
 
-    total = max(games_completed, 1)
-    win_rate = agent_wins / total
-    tie_rate = agent_ties / total
-    loss_rate = agent_losses / total
+    # Wins are fractional (ties split). A fully-uniform draw would give random 20% winshare.
+    random_winrate = random_wins / total_games
+    network_winrate_per_seat = network_wins / total_games / (NUM_PLAYERS - 1)
 
-    z = 1.96
-    p, n = win_rate, total
-    denom = 1 + z * z / n
-    center = (p + z * z / (2 * n)) / denom
-    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denom
-    ci_low = max(0.0, center - half)
-    ci_high = min(1.0, center + half)
+    avg_random_score = sum(score_random_when_random) / len(score_random_when_random)
+    avg_network_score = sum(score_network_when_random) / len(score_network_when_random)
+    avg_dec = sum(decisions_per_game) / len(decisions_per_game)
 
-    if verbose:
-        elapsed = time.time() - start_time
-        print()
-        print(f"=== Results over {games_completed} games ({elapsed:.1f}s) ===")
-        print(f"  Solo wins:  {agent_wins:>6}  ({win_rate * 100:6.2f}%)")
-        print(f"  Ties:       {agent_ties:>6}  ({tie_rate * 100:6.2f}%)")
-        print(f"  Losses:     {agent_losses:>6}  ({loss_rate * 100:6.2f}%)")
-        print(f"  Win rate 95% CI: [{ci_low * 100:.2f}%, {ci_high * 100:.2f}%]")
-        print(f"  Random baseline: {100.0 / NUM_PLAYERS:.2f}%")
-        if ci_low > 1.0 / NUM_PLAYERS:
-            margin = (win_rate - 1.0 / NUM_PLAYERS) * 100
-            print(f"  >> Agent BEATS random baseline by {margin:+.2f} pp (95% CI excludes baseline)")
-        elif ci_high < 1.0 / NUM_PLAYERS:
-            margin = (win_rate - 1.0 / NUM_PLAYERS) * 100
-            print(f"  !! Agent LOSES to random baseline by {margin:+.2f} pp (anti-learning)")
-        else:
-            print(f"  ?? Agent indistinguishable from random at this sample size")
-
-    return {
-        "games": games_completed,
-        "wins": agent_wins,
-        "ties": agent_ties,
-        "losses": agent_losses,
-        "win_rate": win_rate,
-        "tie_rate": tie_rate,
-        "loss_rate": loss_rate,
-        "ci_low": ci_low,
-        "ci_high": ci_high,
-    }
+    print()
+    print("=" * 60)
+    print(f"Games:                           {total_games:>10,}")
+    print(f"Elapsed:                         {elapsed:>10.1f}s")
+    print()
+    print("WIN RATE  (uniform baseline = 20%; lower for random = better network)")
+    print(f"  random seat:                   {random_winrate*100:>9.2f}%")
+    print(f"  network seat (avg of 4):       {network_winrate_per_seat*100:>9.2f}%")
+    print()
+    print("AVG SCORE  (lower = better)")
+    print(f"  random seat:                   {avg_random_score:>10.2f}")
+    print(f"  network seat (avg of 4):       {avg_network_score:>10.2f}")
+    print()
+    print(f"Decisions / player / game:       {avg_dec:>10.2f}")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, default="latest_model.pt")
-    parser.add_argument("--num_envs", type=int, default=2048)
-    parser.add_argument("--games", type=int, default=5000)
-    parser.add_argument("--player", type=int, default=0)
-    parser.add_argument("--no-amp", action="store_true")
-    parser.add_argument("--no-simplified", action="store_true",
-                        help="Use full env (only for evaluating old-format checkpoints)")
-    args = parser.parse_args()
-
-    evaluate_vs_random(
-        model_path=args.model,
-        num_envs=args.num_envs,
-        target_games=args.games,
-        agent_player=args.player,
-        use_mixed_precision=not args.no_amp,
-        simplified=not args.no_simplified,
-    )
+    main()
